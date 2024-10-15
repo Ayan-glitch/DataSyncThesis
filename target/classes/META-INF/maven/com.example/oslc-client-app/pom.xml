@@ -1,0 +1,38 @@
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>com.example</groupId>
+  <artifactId>oslc-client-app</artifactId>
+  <version>0.0.1-SNAPSHOT</version>
+  
+  <dependencies>
+    <!-- Apache HttpClient for sending HTTP requests -->
+    <dependency>
+        <groupId>org.apache.httpcomponents</groupId>
+        <artifactId>httpclient</artifactId>
+        <version>4.5.13</version>
+    </dependency>
+
+    <!-- Apache Jena for RDF parsing -->
+    <dependency>
+        <groupId>org.apache.jena</groupId>
+        <artifactId>apache-jena-libs</artifactId>
+        <version>4.8.0</version>
+        <type>pom</type>
+    </dependency>
+
+    <!-- SLF4J API for logging (required by Jena) -->
+    <dependency>
+        <groupId>org.slf4j</groupId>
+        <artifactId>slf4j-api</artifactId>
+        <version>1.7.36</version>
+    </dependency>
+
+    <!-- SLF4J Simple Binding -->
+    <dependency>
+        <groupId>org.slf4j</groupId>
+        <artifactId>slf4j-simple</artifactId>
+        <version>1.7.36</version>
+    </dependency>
+</dependencies>
+
+</project>
