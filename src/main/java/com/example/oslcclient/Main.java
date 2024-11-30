@@ -1,116 +1,158 @@
 package com.example.oslcclient;
 
+import org.apache.commons.text.StringEscapeUtils;
 import org.apache.http.HttpResponse;
 import org.apache.http.client.methods.HttpGet;
-
 import org.apache.http.impl.client.CloseableHttpClient;
 import org.apache.http.impl.client.HttpClients;
-import org.apache.jena.rdf.model.Model;
-import org.apache.jena.rdf.model.ModelFactory;
-import org.apache.jena.rdf.model.Property;
-import org.apache.jena.rdf.model.Resource;
-import org.apache.jena.rdf.model.StmtIterator;
-import org.apache.jena.rdf.model.Statement;
+import org.apache.jena.rdf.model.*;
 import org.apache.jena.vocabulary.RDF;
+import org.json.JSONArray;
+import org.json.JSONObject;
+import org.json.JSONException;
 
-import java.io.BufferedReader;
-import java.io.InputStreamReader;
-import java.io.OutputStream;
-import java.io.InputStream;
+import java.io.*;
 import java.net.HttpURLConnection;
-import java.net.URL;
 import java.net.URI;
-import java.util.Base64;
+import java.net.URL;
+import java.util.*;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 
+/**
+ * Main class responsible for fetching RDF data from CodeBeamer Mock server, parsing
+ * it, and updating a database (ArcadeDB) accordingly with a scheduled task.
+ */
 public class Main {
 
-    private static String arcadeDBUrl = "http://localhost:2480/api/v1/command/test-db";
-    private static String username = "root";
-    private static String password = "playwithdata";
+	 // Logger for logging events
+    private static final Logger logger = Logger.getLogger(MainNew.class.getName());
+    
+    // Scheduler for running tasks periodically
+    private static final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(1);
+    
+    // ArcadeDB endpoint and credentials
+    private static final String arcadeDBUrl = "http://localhost:2480/api/v1/command/test-db";
+    private static final String username = "root";
+    private static final String password = "playwithdata";
 
+    /**
+     * Main method to set up and start the scheduled task for fetching and processing RDF data.
+     */    
     public static void main(String[] args) {
+        // Start scheduled task to run every 5 minutes
+        logger.info("Starting scheduled task...");
+        scheduler.scheduleAtFixedRate(() -> {
+            try {
+                runTask();
+                logger.info("Task completed successfully.");
+            } catch (Exception e) {
+                logger.log(Level.SEVERE, "Error in scheduled task execution", e);
+            }
+        }, 0, 3, TimeUnit.MINUTES);
 
+        // A shutdown hook to cleanly stop the scheduler
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            logger.info("Shutdown initiated. Stopping scheduled tasks...");
+            scheduler.shutdown();
+            try {
+                if (!scheduler.awaitTermination(5, TimeUnit.SECONDS)) {
+                    logger.warning("Scheduler did not terminate within the specified time.");
+                    scheduler.shutdownNow();
+                }
+                logger.info("Scheduler stopped successfully.");
+            } catch (InterruptedException e) {
+                logger.log(Level.SEVERE, "Scheduler termination interrupted", e);
+                Thread.currentThread().interrupt();
+            }
+        }));
+
+        logger.info("Scheduled task setup complete. Task will run every 5 minutes.");
+    }
+
+    /**
+     * Runs the primary task of fetching RDF data, parsing it, and updating ArcadeDB.
+     */    
+    private static void runTask() {
         String mockServerUrl = "https://a06218af-9740-4e68-aa6a-d0d35a857859.mock.pstmn.io/requirements";
-        // Create HTTP client to retrieve RDF data
         try (CloseableHttpClient httpClient = HttpClients.createDefault()) {
-
-            // Create HTTP GET request to fetch the RDF data
             HttpGet request = new HttpGet(mockServerUrl);
             request.setHeader("Accept", "application/rdf+xml");
 
-            // Execute the HTTP request and get the response
             HttpResponse response = httpClient.execute(request);
             int statusCode = response.getStatusLine().getStatusCode();
 
             if (statusCode == 200) {
-                // Get RDF content from the response
+                // Read and parse RDF content
                 InputStream content = response.getEntity().getContent();
-
-                // Parse RDF using Jena
                 Model model = ModelFactory.createDefaultModel();
                 model.read(content, null);
 
-                // Define properties to extract
+                // Define RDF properties for parsing
                 Property identifierProperty = model.getProperty("http://purl.org/dc/terms/identifier");
                 Property titleProperty = model.getProperty("http://purl.org/dc/terms/title");
                 Property createdProperty = model.getProperty("http://purl.org/dc/terms/created");
                 Property modifiedProperty = model.getProperty("http://purl.org/dc/terms/modified");
                 Property statusProperty = model.getProperty("http://localhost:8080/cb/api/oslc/ns/rm#status");
 
-                // Iterate through the RDF data and extract each Requirement
+                // Iterate over RDF requirements and process them
                 StmtIterator iter = model.listStatements(null, RDF.type, model.getResource("http://open-services.net/ns/rm#Requirement"));
 
                 while (iter.hasNext()) {
                     Statement stmt = iter.next();
-                    Resource requirementResource = stmt.getSubject();  // The Requirement resource
+                    Resource requirementResource = stmt.getSubject();
 
-                    // Extract the required properties from each Requirement
                     String identifier = getPropertyStringValue(requirementResource, identifierProperty);
                     String title = getPropertyStringValue(requirementResource, titleProperty);
                     String created = getPropertyStringValue(requirementResource, createdProperty);
                     String modified = getPropertyStringValue(requirementResource, modifiedProperty);
                     String status = getPropertyStringValue(requirementResource, statusProperty);
 
-                    // Check if the requirement exists in ArcadeDB
-                    String existingVertexQuery = String.format("SELECT FROM Requirement WHERE identifier='%s'", identifier);
-                    boolean exists = checkVertexExists(existingVertexQuery);
+                    // Check for existing vertex in ArcadeDB with the same identifier and status
+                    String existingVertexQuery = String.format("SELECT * FROM Requirement WHERE identifier='%s' AND status='New'", identifier);
+                    JSONObject existingNode = getExistingVertexData(existingVertexQuery);
 
-                    if (exists) {
-                        // Compare modified timestamp to see if the data has changed
-                        String existingModified = getExistingVertexProperty("modified", identifier);
+                    // Check if data has changed compared to the stored vertex
+                    if (existingNode != null) {
+                        String storedTitle = existingNode.optString("title");
+                        boolean hasChanges = !normalizeText(storedTitle).equals(normalizeText(title)) ||
+                                             !existingNode.optString("created").equals(created) ||
+                                             !existingNode.optString("modified").equals(modified) ||
+                                             !existingNode.optString("status").equals(status);
 
-                        if (!existingModified.equals(modified)) {
-                            // Create a new vertex for the updated data
+                        // Update database with new vertex and link edges if changes detected
+                        if (hasChanges) {
                             String newVertexQuery = String.format(
-                                "CREATE VERTEX Requirement SET identifier='%s', title='%s', created='%s', modified='%s', status='Active'",
-                                identifier, title, created, modified
+                                "CREATE VERTEX Requirement SET identifier='%s', title='%s', created='%s', modified='%s', status='New'",
+                                identifier, escapeForSql(title), created, modified
                             );
                             executeArcadeDBCommand(newVertexQuery);
 
-                            // Fetch the @rid for the old and new vertices
-                            String oldVertexRid = getExistingVertexRid("identifier", identifier, "modified", existingModified);
+                            String oldVertexRid = existingNode.getString("@rid");
                             String newVertexRid = getExistingVertexRid("identifier", identifier, "modified", modified);
 
-                            // Create an edge linking the new vertex to the old one with the label "updated from"
-                            if (!oldVertexRid.isEmpty() && !newVertexRid.isEmpty()) {
+                            if (!oldVertexRid.isEmpty() && !newVertexRid.isEmpty() && !newVertexRid.equals(oldVertexRid)) {
                                 String linkVerticesQuery = String.format(
-                                    "CREATE EDGE `updated_from` FROM %s TO %s",  newVertexRid, oldVertexRid
+                                    "CREATE EDGE `updated_from` FROM %s TO %s", newVertexRid, oldVertexRid
                                 );
                                 executeArcadeDBCommand(linkVerticesQuery);
+                                copyEdges(oldVertexRid, newVertexRid);
                             }
 
-                            // Mark the old vertex as "End of life"
                             String updateOldVertexQuery = String.format(
-                                "UPDATE Requirement SET status='End of life' WHERE identifier='%s' AND modified='%s'",
-                                identifier, existingModified
+                                "UPDATE Requirement SET status='End of life', endOfLife='%s' WHERE @rid='%s'",
+                                modified, oldVertexRid
                             );
                             executeArcadeDBCommand(updateOldVertexQuery);
                         }
                     } else {
-                        // Insert a new vertex as this requirement does not exist
                         String createVertexQuery = String.format(
+                        	// Create a new vertex if no matching record exists	
                             "CREATE VERTEX Requirement SET identifier='%s', title='%s', created='%s', modified='%s', status='%s'",
-                            identifier, title, created, modified, status
+                            identifier, escapeForSql(title), created, modified, status
                         );
                         executeArcadeDBCommand(createVertexQuery);
                     }
@@ -118,15 +160,17 @@ public class Main {
 
                 content.close();
             } else {
-                System.err.println("Failed to retrieve RDF data. HTTP Status Code: " + statusCode);
+                logger.warning("Failed to retrieve RDF data. HTTP Status Code: " + statusCode);
             }
 
         } catch (Exception e) {
-            e.printStackTrace();
+            logger.log(Level.SEVERE, "Error occurred while fetching RDF data", e);
         }
     }
 
-    // Function to get the string value of a property from a Resource
+    /**
+     * Retrieves the string value of a given RDF property from a resource.
+     */
     private static String getPropertyStringValue(Resource resource, Property property) {
         Statement stmt = resource.getProperty(property);
         if (stmt != null && stmt.getObject().isLiteral()) {
@@ -135,24 +179,41 @@ public class Main {
         return "";
     }
 
-    // Function to send an HTTP POST request to ArcadeDB to execute an SQL command
+    /**
+     * Escapes text to make it SQL-safe.
+     */
+    private static String escapeForSql(String input) {
+        return input.replace("'", "\\'");
+    }
+
+    /**
+     * Normalizes text by removing HTML escape sequences and trimming whitespace.
+     */
+    private static String normalizeText(String text) {
+        if (text == null) return "";
+        return StringEscapeUtils.unescapeHtml4(text).trim();
+    }
+
+    /**
+     * Executes a command in ArcadeDB using HTTP POST request.
+     */
     private static void executeArcadeDBCommand(String command) {
         try {
             URI uri = new URI(arcadeDBUrl);
-            URL url = uri.toURL();  // Convert URI to URL
+            URL url = uri.toURL();
             HttpURLConnection conn = (HttpURLConnection) url.openConnection();
             conn.setRequestMethod("POST");
             conn.setRequestProperty("Content-Type", "application/json");
             conn.setRequestProperty("Accept", "application/json");
             conn.setDoOutput(true);
 
-            // Add Basic Authentication header
+            // Set authorization header
             String auth = username + ":" + password;
             String encodedAuth = Base64.getEncoder().encodeToString(auth.getBytes());
             String authHeaderValue = "Basic " + encodedAuth;
             conn.setRequestProperty("Authorization", authHeaderValue);
 
-            // Format command into JSON body
+            // Prepare and send JSON payload
             String jsonInputString = "{\"command\": \"" + command + "\", \"language\": \"sql\"}";
 
             try (OutputStream os = conn.getOutputStream()) {
@@ -160,38 +221,39 @@ public class Main {
                 os.write(input, 0, input.length);
             }
 
+            // Check response for command execution status
             int responseCode = conn.getResponseCode();
             if (responseCode == HttpURLConnection.HTTP_OK) {
-                System.out.println("Command executed: " + command);
+                logger.info("Command executed successfully: " + command);
             } else {
-                System.out.println("Failed to execute command: " + command);
+                logger.warning("Failed to execute command: " + command);
             }
 
             conn.disconnect();
 
         } catch (Exception e) {
-            e.printStackTrace();
+            logger.log(Level.SEVERE, "Error executing ArcadeDB command", e);
         }
     }
 
-    // Check if a vertex with a given identifier already exists in ArcadeDB
-    private static boolean checkVertexExists(String query) {
+    /**
+     * Fetches existing vertex data from ArcadeDB using a SQL query.
+     */
+    private static JSONObject getExistingVertexData(String query) {
         try {
             URI uri = new URI(arcadeDBUrl);
-            URL url = uri.toURL();  // Convert URI to URL
+            URL url = uri.toURL();
             HttpURLConnection conn = (HttpURLConnection) url.openConnection();
             conn.setRequestMethod("POST");
             conn.setRequestProperty("Content-Type", "application/json");
             conn.setRequestProperty("Accept", "application/json");
             conn.setDoOutput(true);
 
-            // Add Basic Authentication header
             String auth = username + ":" + password;
             String encodedAuth = Base64.getEncoder().encodeToString(auth.getBytes());
             String authHeaderValue = "Basic " + encodedAuth;
             conn.setRequestProperty("Authorization", authHeaderValue);
 
-            // Format query into JSON body
             String jsonInputString = "{\"command\": \"" + query + "\", \"language\": \"sql\"}";
 
             try (OutputStream os = conn.getOutputStream()) {
@@ -203,14 +265,17 @@ public class Main {
             if (responseCode == HttpURLConnection.HTTP_OK) {
                 BufferedReader in = new BufferedReader(new InputStreamReader(conn.getInputStream()));
                 String inputLine;
-                StringBuffer content = new StringBuffer();
+                StringBuilder content = new StringBuilder();
                 while ((inputLine = in.readLine()) != null) {
                     content.append(inputLine);
                 }
                 in.close();
-                
-                // Check if the result contains any vertices
-                return content.toString().contains("@rid");
+
+                JSONObject jsonResponse = new JSONObject(content.toString());
+                JSONArray resultArray = jsonResponse.optJSONArray("result");
+                if (resultArray != null && resultArray.length() > 0) {
+                    return resultArray.getJSONObject(0);
+                }
             }
 
             conn.disconnect();
@@ -219,28 +284,147 @@ public class Main {
             e.printStackTrace();
         }
 
-        return false;
+        return null;
     }
-    
-    // Get the @rid of a vertex based on identifier and modified values
+
+    /**
+     * Copies edges between vertices in ArcadeDB to maintain relationships.
+     */
+    private static void copyEdges(String oldVertexRid, String newVertexRid) {
+        try {
+            String getOutgoingEdgesQuery = String.format(
+                "SELECT @rid, @type, @out, @in FROM (SELECT expand(outE()) FROM %s) WHERE @type != 'updated_from'", oldVertexRid
+            );
+            String[][] outgoingEdges = getEdgesFromQuery(getOutgoingEdgesQuery);
+
+            for (String[] edgeData : outgoingEdges) {
+                String edgeType = edgeData[1];
+                String targetVertexRid = edgeData[3];
+                String createOutgoingEdgeQuery = String.format(
+                    "CREATE EDGE %s FROM %s TO %s IF NOT EXISTS", edgeType, newVertexRid, targetVertexRid
+                );
+                executeArcadeDBCommand(createOutgoingEdgeQuery);
+            }
+
+            String getIncomingEdgesQuery = String.format(
+                "SELECT @rid, @type, @out, @in FROM (SELECT expand(inE()) FROM %s) WHERE @type != 'updated_from'", oldVertexRid
+            );
+            String[][] incomingEdges = getEdgesFromQuery(getIncomingEdgesQuery);
+
+            for (String[] edgeData : incomingEdges) {
+                String edgeType = edgeData[1];
+                String sourceVertexRid = edgeData[2];
+                String createIncomingEdgeQuery = String.format(
+                    "CREATE EDGE %s FROM %s TO %s IF NOT EXISTS", edgeType, sourceVertexRid, newVertexRid
+                );
+                executeArcadeDBCommand(createIncomingEdgeQuery);
+            }
+
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+
+    /**
+     * Executes a query to retrieve edge data in ArcadeDB.
+     */
+    private static String[][] getEdgesFromQuery(String query) {
+        List<String[]> edges = new ArrayList<>();
+        try {
+            URI uri = new URI(arcadeDBUrl);
+            URL url = uri.toURL();
+            HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+            conn.setRequestMethod("POST");
+            conn.setRequestProperty("Content-Type", "application/json");
+            conn.setRequestProperty("Accept", "application/json");
+            conn.setDoOutput(true);
+
+            String auth = username + ":" + password;
+            String encodedAuth = Base64.getEncoder().encodeToString(auth.getBytes());
+            String authHeaderValue = "Basic " + encodedAuth;
+            conn.setRequestProperty("Authorization", authHeaderValue);
+
+            String jsonInputString = "{\"command\": \"" + query + "\", \"language\": \"sql\"}";
+
+            try (OutputStream os = conn.getOutputStream()) {
+                byte[] input = jsonInputString.getBytes("utf-8");
+                os.write(input, 0, input.length);
+            }
+
+            int responseCode = conn.getResponseCode();
+            if (responseCode == HttpURLConnection.HTTP_OK) {
+                BufferedReader in = new BufferedReader(new InputStreamReader(conn.getInputStream()));
+                String inputLine;
+                StringBuilder content = new StringBuilder();
+                while ((inputLine = in.readLine()) != null) {
+                    content.append(inputLine);
+                }
+                in.close();
+
+                edges = extractEdgeDataFromResult(content.toString());
+            }
+
+            conn.disconnect();
+
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+        return edges.toArray(new String[0][0]);
+    }
+
+    /**
+     * Parses and extracts edge information from a JSON response string.
+     */
+    private static List<String[]> extractEdgeDataFromResult(String result) {
+        List<String[]> edges = new ArrayList<>();
+
+        try {
+            JSONObject jsonResponse = new JSONObject(result);
+            JSONArray resultArray = jsonResponse.optJSONArray("result");
+
+            if (resultArray == null || resultArray.length() == 0) {
+                System.out.println("Result array is empty; no edges to process.");
+                return edges;
+            }
+
+            for (int i = 0; i < resultArray.length(); i++) {
+                JSONObject resultObject = resultArray.getJSONObject(i);
+                if (resultObject.has("@rid") && resultObject.has("@type") &&
+                    resultObject.has("@out") && resultObject.has("@in")) {
+                    String edgeRid = resultObject.getString("@rid");
+                    String edgeType = resultObject.getString("@type");
+                    String outVertexRid = resultObject.getString("@out");
+                    String inVertexRid = resultObject.getString("@in");
+                    edges.add(new String[]{edgeRid, edgeType, outVertexRid, inVertexRid});
+                }
+            }
+
+        } catch (JSONException e) {
+            e.printStackTrace();
+        }
+
+        return edges;
+    }
+
+    /**
+     * Retrieves the RID of an existing vertex using identifier and modification properties.
+     */
     private static String getExistingVertexRid(String identifierProperty, String identifierValue, String modifiedProperty, String modifiedValue) {
         String query = String.format("SELECT @rid FROM Requirement WHERE %s='%s' AND %s='%s'", identifierProperty, identifierValue, modifiedProperty, modifiedValue);
         try {
             URI uri = new URI(arcadeDBUrl);
-            URL url = uri.toURL();  // Convert URI to URL
+            URL url = uri.toURL();
             HttpURLConnection conn = (HttpURLConnection) url.openConnection();
             conn.setRequestMethod("POST");
             conn.setRequestProperty("Content-Type", "application/json");
             conn.setRequestProperty("Accept", "application/json");
             conn.setDoOutput(true);
 
-            // Add Basic Authentication header
             String auth = username + ":" + password;
             String encodedAuth = Base64.getEncoder().encodeToString(auth.getBytes());
             String authHeaderValue = "Basic " + encodedAuth;
             conn.setRequestProperty("Authorization", authHeaderValue);
 
-            // Format query into JSON body
             String jsonInputString = "{\"command\": \"" + query + "\", \"language\": \"sql\"}";
 
             try (OutputStream os = conn.getOutputStream()) {
@@ -252,13 +436,12 @@ public class Main {
             if (responseCode == HttpURLConnection.HTTP_OK) {
                 BufferedReader in = new BufferedReader(new InputStreamReader(conn.getInputStream()));
                 String inputLine;
-                StringBuffer content = new StringBuffer();
+                StringBuilder content = new StringBuilder();
                 while ((inputLine = in.readLine()) != null) {
                     content.append(inputLine);
                 }
                 in.close();
 
-                // Extract the @rid from the JSON result
                 return extractRidFromResult(content.toString());
             }
 
@@ -271,74 +454,14 @@ public class Main {
         return "";
     }
 
-    // Helper function to extract @rid from ArcadeDB JSON response
+    /**
+     * Extracts the RID (record ID) from a JSON-formatted result string.
+     */
     private static String extractRidFromResult(String result) {
         String ridPattern = "\"@rid\":\"";
         int startIndex = result.indexOf(ridPattern);
         if (startIndex != -1) {
             startIndex += ridPattern.length();
-            int endIndex = result.indexOf("\"", startIndex);
-            return result.substring(startIndex, endIndex);
-        }
-        return "";
-    }
-
-
-    // Get an existing vertex property (e.g., modified date) for a given identifier
-    private static String getExistingVertexProperty(String property, String identifier) {
-        String query = String.format("SELECT %s FROM Requirement WHERE identifier='%s'", property, identifier);
-        try {
-            URI uri = new URI(arcadeDBUrl);
-            URL url = uri.toURL();  // Convert URI to URL
-            HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-            conn.setRequestMethod("POST");
-            conn.setRequestProperty("Content-Type", "application/json");
-            conn.setRequestProperty("Accept", "application/json");
-            conn.setDoOutput(true);
-
-            // Add Basic Authentication header
-            String auth = username + ":" + password;
-            String encodedAuth = Base64.getEncoder().encodeToString(auth.getBytes());
-            String authHeaderValue = "Basic " + encodedAuth;
-            conn.setRequestProperty("Authorization", authHeaderValue);
-
-            // Format query into JSON body
-            String jsonInputString = "{\"command\": \"" + query + "\", \"language\": \"sql\"}";
-
-            try (OutputStream os = conn.getOutputStream()) {
-                byte[] input = jsonInputString.getBytes("utf-8");
-                os.write(input, 0, input.length);
-            }
-
-            int responseCode = conn.getResponseCode();
-            if (responseCode == HttpURLConnection.HTTP_OK) {
-                BufferedReader in = new BufferedReader(new InputStreamReader(conn.getInputStream()));
-                String inputLine;
-                StringBuffer content = new StringBuffer();
-                while ((inputLine = in.readLine()) != null) {
-                    content.append(inputLine);
-                }
-                in.close();
-
-                // Extract the "modified" field value from the JSON result
-                return extractFieldValueFromResult(content.toString(), property);
-            }
-
-            conn.disconnect();
-
-        } catch (Exception e) {
-            e.printStackTrace();
-        }
-
-        return "";
-    }
-
-    // A helper method to extract the field value from the JSON result
-    private static String extractFieldValueFromResult(String result, String fieldName) {
-        String fieldPattern = "\"" + fieldName + "\":\"";
-        int startIndex = result.indexOf(fieldPattern);
-        if (startIndex != -1) {
-            startIndex += fieldPattern.length();
             int endIndex = result.indexOf("\"", startIndex);
             return result.substring(startIndex, endIndex);
         }
